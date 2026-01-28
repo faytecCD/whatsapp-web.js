@@ -88,6 +88,8 @@ class Client extends EventEmitter {
 
         this.currentIndexHtml = null;
         this.lastLoggedOut = false;
+        this._authEventListenersInjected = false; // Prevent duplicate event listeners
+        this._readyEmitted = false; // Prevent duplicate READY events
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -212,66 +214,79 @@ class Client extends EventEmitter {
         });
 
         await exposeFunctionIfAbsent(this.pupPage, 'onAppStateHasSyncedEvent', async () => {
-            const authEventPayload = await this.authStrategy.getAuthEventPayload();
-            /**
+            // Guard against multiple READY events (e.g., if hasSynced toggles true->false->true)
+            if (this._readyEmitted) return;
+
+            try {
+                const authEventPayload = await this.authStrategy.getAuthEventPayload();
+                /**
                  * Emitted when authentication is successful
                  * @event Client#authenticated
                  */
-            this.emit(Events.AUTHENTICATED, authEventPayload);
+                this.emit(Events.AUTHENTICATED, authEventPayload);
 
-            const injected = await this.pupPage.evaluate(async () => {
-                return typeof window.Store !== 'undefined' && typeof window.WWebJS !== 'undefined';
-            });
+                const injected = await this.pupPage.evaluate(async () => {
+                    return typeof window.Store !== 'undefined' && typeof window.WWebJS !== 'undefined';
+                });
 
-            if (!injected) {
-                if (this.options.webVersionCache.type === 'local' && this.currentIndexHtml) {
-                    const { type: webCacheType, ...webCacheOptions } = this.options.webVersionCache;
-                    const webCache = WebCacheFactory.createWebCache(webCacheType, webCacheOptions);
-            
-                    await webCache.persist(this.currentIndexHtml, version);
-                }
+                if (!injected) {
+                    if (this.options.webVersionCache.type === 'local' && this.currentIndexHtml) {
+                        const { type: webCacheType, ...webCacheOptions } = this.options.webVersionCache;
+                        const webCache = WebCacheFactory.createWebCache(webCacheType, webCacheOptions);
 
-                if (isCometOrAbove) {
-                    await this.pupPage.evaluate(ExposeStore);
-                } else {
-                    // make sure all modules are ready before injection
-                    // 2 second delay after authentication makes sense and does not need to be made dyanmic or removed
-                    await new Promise(r => setTimeout(r, 2000)); 
-                    await this.pupPage.evaluate(ExposeLegacyStore);
-                }
-                let start = Date.now();
-                let res = false;
-                while(start > (Date.now() - 30000)){
-                    // Check window.Store Injection
-                    res = await this.pupPage.evaluate('window.Store != undefined');
-                    if(res){break;}
-                    await new Promise(r => setTimeout(r, 200));
-                }
-                if(!res){
-                    throw 'ready timeout';
-                }
-            
-                /**
+                        await webCache.persist(this.currentIndexHtml, version);
+                    }
+
+                    if (isCometOrAbove) {
+                        await this.pupPage.evaluate(ExposeStore);
+                    } else {
+                        // make sure all modules are ready before injection
+                        // 2 second delay after authentication makes sense and does not need to be made dyanmic or removed
+                        await new Promise(r => setTimeout(r, 2000));
+                        await this.pupPage.evaluate(ExposeLegacyStore);
+                    }
+                    let start = Date.now();
+                    let res = false;
+                    while(start > (Date.now() - 30000)){
+                        // Check window.Store Injection
+                        res = await this.pupPage.evaluate('window.Store != undefined');
+                        if(res){break;}
+                        await new Promise(r => setTimeout(r, 200));
+                    }
+                    if(!res){
+                        throw new Error('Store injection timeout - ready event cannot be emitted');
+                    }
+
+                    /**
                      * Current connection information
                      * @type {ClientInfo}
                      */
-                this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
-                    return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
-                }));
+                    this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
+                        return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
+                    }));
 
-                this.interface = new InterfaceController(this);
+                    this.interface = new InterfaceController(this);
 
-                //Load util functions (serializers, helper functions)
-                await this.pupPage.evaluate(LoadUtils);
+                    //Load util functions (serializers, helper functions)
+                    await this.pupPage.evaluate(LoadUtils);
 
-                await this.attachEventListeners();
-            }
-            /**
+                    await this.attachEventListeners();
+                }
+                /**
                  * Emitted when the client has initialized and is ready to receive messages.
                  * @event Client#ready
                  */
-            this.emit(Events.READY);
-            this.authStrategy.afterAuthReady();
+                this._readyEmitted = true;
+                this.emit(Events.READY);
+                this.authStrategy.afterAuthReady();
+            } catch (err) {
+                // Emit error event so users can handle initialization failures
+                // Without this, errors in this callback silently prevent ready from firing
+                // See: https://github.com/pedroslopez/whatsapp-web.js/issues/5685
+                const error = err instanceof Error ? err : new Error(String(err));
+                console.error('[wwebjs] Error in onAppStateHasSyncedEvent:', error.message);
+                this.emit(Events.AUTHENTICATION_FAILURE, error.message);
+            }
         });
         let lastPercent = null;
         await exposeFunctionIfAbsent(this.pupPage, 'onOfflineProgressUpdateEvent', async (percent) => {
@@ -284,16 +299,48 @@ class Client extends EventEmitter {
             this.lastLoggedOut = true;
             await this.pupPage.waitForNavigation({waitUntil: 'load', timeout: 5000}).catch((_) => _);
         });
-        await this.pupPage.evaluate(() => {
-            window.AuthStore.AppState.on('change:state', (_AppState, state) => { window.onAuthAppStateChangedEvent(state); });
-            window.AuthStore.AppState.on('change:hasSynced', () => { window.onAppStateHasSyncedEvent(); });
-            window.AuthStore.Cmd.on('offline_progress_update', () => {
-                window.onOfflineProgressUpdateEvent(window.AuthStore.OfflineMessageHandler.getOfflineDeliveryProgress()); 
+
+        // Check if page lost its listener registration state (e.g., after page navigation/reload)
+        // If so, reset the client-side flag to allow re-registration
+        // See: https://github.com/pedroslopez/whatsapp-web.js/issues/5717
+        const pageHasListeners = await this.pupPage.evaluate(() => !!window._authListenersRegistered);
+        if (!pageHasListeners) {
+            this._authEventListenersInjected = false;
+        }
+
+        // Only register auth event listeners once to prevent duplicate READY events
+        if (!this._authEventListenersInjected) {
+            await this.pupPage.evaluate(() => {
+                // Guard against duplicate listeners in the page context as well
+                if (window._authListenersRegistered) return;
+                window._authListenersRegistered = true;
+
+                const appState = window.AuthStore.AppState;
+
+                // Fix race condition: If hasSynced is already true (fast session restore),
+                // the change:hasSynced event will never fire. Check current state immediately.
+                // See: https://github.com/pedroslopez/whatsapp-web.js/pull/5748
+                if (appState.hasSynced) {
+                    window.onAppStateHasSyncedEvent();
+                }
+
+                // Register listener for future state changes
+                appState.on('change:hasSynced', (_AppState, hasSynced) => {
+                    if (hasSynced) {
+                        window.onAppStateHasSyncedEvent();
+                    }
+                });
+
+                appState.on('change:state', (_AppState, state) => { window.onAuthAppStateChangedEvent(state); });
+                window.AuthStore.Cmd.on('offline_progress_update', () => {
+                    window.onOfflineProgressUpdateEvent(window.AuthStore.OfflineMessageHandler.getOfflineDeliveryProgress());
+                });
+                window.AuthStore.Cmd.on('logout', async () => {
+                    await window.onLogoutEvent();
+                });
             });
-            window.AuthStore.Cmd.on('logout', async () => {
-                await window.onLogoutEvent();
-            });
-        });
+            this._authEventListenersInjected = true;
+        }
     }
 
     /**
@@ -775,69 +822,76 @@ class Client extends EventEmitter {
             });
             window.Store.Chat.on('change:unreadCount', (chat) => {window.onChatUnreadCountEvent(chat);});
 
+            // Reaction and poll vote listeners - version dependent
             if (window.compareWwebVersions(window.Debug.VERSION, '>=', '2.3000.1014111620')) {
-                const module = window.Store.AddonReactionTable;
-                const ogMethod = module.bulkUpsert;
-                module.bulkUpsert = ((...args) => {
-                    window.onReaction(args[0].map(reaction => {
-                        const msgKey = reaction.id;
-                        const parentMsgKey = reaction.reactionParentKey;
-                        const timestamp = reaction.reactionTimestamp / 1000;
-                        const sender = reaction.author ?? reaction.from;
-                        const senderUserJid = sender._serialized;
+                if (window.Store.AddonReactionTable) {
+                    const module = window.Store.AddonReactionTable;
+                    const ogMethod = module.bulkUpsert;
+                    module.bulkUpsert = ((...args) => {
+                        window.onReaction(args[0].map(reaction => {
+                            const msgKey = reaction.id;
+                            const parentMsgKey = reaction.reactionParentKey;
+                            const timestamp = reaction.reactionTimestamp / 1000;
+                            const sender = reaction.author ?? reaction.from;
+                            const senderUserJid = sender._serialized;
 
-                        return {...reaction, msgKey, parentMsgKey, senderUserJid, timestamp };
-                    }));
+                            return {...reaction, msgKey, parentMsgKey, senderUserJid, timestamp };
+                        }));
 
-                    return ogMethod(...args);
-                }).bind(module);
+                        return ogMethod(...args);
+                    }).bind(module);
+                }
 
-                const pollVoteModule = window.Store.AddonPollVoteTable;
-                const ogPollVoteMethod = pollVoteModule.bulkUpsert;
+                if (window.Store.AddonPollVoteTable) {
+                    const pollVoteModule = window.Store.AddonPollVoteTable;
+                    const ogPollVoteMethod = pollVoteModule.bulkUpsert;
 
-                pollVoteModule.bulkUpsert = (async (...args) => {
-                    const votes = await Promise.all(args[0].map(async vote => {
-                        const msgKey = vote.id;
-                        const parentMsgKey = vote.pollUpdateParentKey;
-                        const timestamp = vote.t / 1000;
-                        const sender = vote.author ?? vote.from;
-                        const senderUserJid = sender._serialized;
+                    pollVoteModule.bulkUpsert = (async (...args) => {
+                        const votes = await Promise.all(args[0].map(async vote => {
+                            const msgKey = vote.id;
+                            const parentMsgKey = vote.pollUpdateParentKey;
+                            const timestamp = vote.t / 1000;
+                            const sender = vote.author ?? vote.from;
+                            const senderUserJid = sender._serialized;
 
-                        let parentMessage = window.Store.Msg.get(parentMsgKey._serialized);
-                        if (!parentMessage) {
-                            const fetched = await window.Store.Msg.getMessagesById([parentMsgKey._serialized]);
-                            parentMessage = fetched?.messages?.[0] || null;
-                        }
+                            let parentMessage = window.Store.Msg.get(parentMsgKey._serialized);
+                            if (!parentMessage) {
+                                const fetched = await window.Store.Msg.getMessagesById([parentMsgKey._serialized]);
+                                parentMessage = fetched?.messages?.[0] || null;
+                            }
 
-                        return {
-                            ...vote,
-                            msgKey,
-                            sender,
-                            parentMsgKey,
-                            senderUserJid,
-                            timestamp,
-                            parentMessage
-                        };
-                    }));
+                            return {
+                                ...vote,
+                                msgKey,
+                                sender,
+                                parentMsgKey,
+                                senderUserJid,
+                                timestamp,
+                                parentMessage
+                            };
+                        }));
 
-                    window.onPollVoteEvent(votes);
+                        window.onPollVoteEvent(votes);
 
-                    return ogPollVoteMethod.apply(pollVoteModule, args);
-                }).bind(pollVoteModule);
+                        return ogPollVoteMethod.apply(pollVoteModule, args);
+                    }).bind(pollVoteModule);
+                }
             } else {
-                const module = window.Store.createOrUpdateReactionsModule;
-                const ogMethod = module.createOrUpdateReactions;
-                module.createOrUpdateReactions = ((...args) => {
-                    window.onReaction(args[0].map(reaction => {
-                        const msgKey = window.Store.MsgKey.fromString(reaction.msgKey);
-                        const parentMsgKey = window.Store.MsgKey.fromString(reaction.parentMsgKey);
-                        const timestamp = reaction.timestamp / 1000;
+                if (window.Store.createOrUpdateReactionsModule) {
+                    const module = window.Store.createOrUpdateReactionsModule;
+                    const ogMethod = module.createOrUpdateReactions;
+                    module.createOrUpdateReactions = ((...args) => {
+                        window.onReaction(args[0].map(reaction => {
+                            const msgKey = window.Store.MsgKey.fromString(reaction.msgKey);
+                            const parentMsgKey = window.Store.MsgKey.fromString(reaction.parentMsgKey);
+                            const timestamp = reaction.timestamp / 1000;
 
-                        return {...reaction, msgKey, parentMsgKey, timestamp };
-                    }));
+                            return {...reaction, msgKey, parentMsgKey, timestamp };
+                        }));
 
-                    return ogMethod(...args);
-                }).bind(module);
+                        return ogMethod(...args);
+                    }).bind(module);
+                }
             }
         });
     }    
