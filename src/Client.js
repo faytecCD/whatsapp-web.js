@@ -1458,7 +1458,8 @@ class Client extends EventEmitter {
      */
     async setDisplayName(displayName) {
         const couldSet = await this.pupPage.evaluate(async displayName => {
-            if(!window.Store.Conn.canSetMyPushname()) return false;
+            if(!window.Store.Conn?.canSetMyPushname()) return false;
+            if(typeof window.Store.Settings?.setPushname !== 'function') return false;
             await window.Store.Settings.setPushname(displayName);
             return true;
         }, displayName);
@@ -1472,7 +1473,7 @@ class Client extends EventEmitter {
      */
     async getState() {
         return await this.pupPage.evaluate(() => {
-            if(!window.Store) return null;
+            if(!window.Store || !window.Store.AppState) return null;
             return window.Store.AppState.state;
         });
     }
@@ -2222,7 +2223,7 @@ class Client extends EventEmitter {
     async addOrRemoveLabels(labelIds, chatIds) {
 
         return this.pupPage.evaluate(async (labelIds, chatIds) => {
-            if (['smba', 'smbi'].indexOf(window.Store.Conn.platform) === -1) {
+            if (['smba', 'smbi'].indexOf(window.Store.Conn?.platform) === -1) {
                 throw '[LT01] Only Whatsapp business';
             }
             const labels = window.WWebJS.getLabels().filter(e => labelIds.find(l => l == e.id) !== undefined);
