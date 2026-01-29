@@ -1,3 +1,15 @@
+## WARNING ⚠️
+
+This is not a separate fork, it is just a PR to patch some bugs that have not yet been merged from the source repository,
+and when the original PR is merged, this repository may be deleted in the future.
+
+### Included Pull Requests
+
+- [\#5729](https://github.com/pedroslopez/whatsapp-web.js/pull/5729)
+- [\#5755](https://github.com/pedroslopez/whatsapp-web.js/pull/5755)
+
+---
+
 <div align="center">
     <br />
     <p>
